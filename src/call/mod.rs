@@ -14,7 +14,7 @@
 pub mod client;
 pub mod server;
 
-use std::{ptr, slice, usize};
+use std::{ptr, slice, str, usize};
 use std::sync::Arc;
 
 use cq::CompletionQueue;
@@ -95,6 +95,9 @@ pub struct RpcStatus {
 
     /// Optional detail string.
     pub details: Option<String>,
+
+    /// Optional serialized google.rpc.Status proto message.
+    pub status_proto_bytes: Option<Vec<u8>>,
 }
 
 impl RpcStatus {
@@ -103,6 +106,7 @@ impl RpcStatus {
         RpcStatus {
             status,
             details,
+            status_proto_bytes: None,
         }
     }
 
@@ -132,8 +136,8 @@ impl BatchContext {
     pub fn rpc_status(&self) -> RpcStatus {
         let status =
             unsafe { grpc_sys::grpcwrap_batch_context_recv_status_on_client_status(self.ctx) };
-        let details = if status == RpcStatusCode::Ok {
-            None
+        let (details, status_proto_bytes) = if status == RpcStatusCode::Ok {
+            (None, None)
         } else {
             unsafe {
                 let mut details_len = 0;
@@ -142,13 +146,34 @@ impl BatchContext {
                     &mut details_len,
                 );
                 let details_slice = slice::from_raw_parts(details_ptr as *const _, details_len);
-                Some(String::from_utf8_lossy(details_slice).into_owned())
+                let details = Some(String::from_utf8_lossy(details_slice).into_owned());
+
+                let mut status_proto_bytes = None;
+
+                let metadata = grpc_sys::grpcwrap_batch_context_recv_status_on_client_trailing_metadata(self.ctx);
+                for i in 0..(*metadata).count {
+                    let mut key_len = 0;
+                    let key = grpc_sys::grpcwrap_metadata_array_get_key(metadata, i, &mut key_len);
+                    let key_str = str::from_utf8_unchecked(slice::from_raw_parts(key as _, key_len));
+                    if key_str != "grpc-status-details-bin" {
+                        continue
+                    }
+
+                    let mut val_len = 0;
+                    let val = grpc_sys::grpcwrap_metadata_array_get_value(metadata, i, &mut val_len);
+                    let val_bytes = slice::from_raw_parts(val as *const u8, val_len);
+                    status_proto_bytes = Some(val_bytes.to_owned());
+                    break;
+                }
+
+                (details, status_proto_bytes)
             }
         };
 
         RpcStatus {
             status,
             details,
+            status_proto_bytes,
         }
     }
 
