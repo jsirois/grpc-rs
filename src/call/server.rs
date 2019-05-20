@@ -11,21 +11,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{result, slice};
-use std::sync::Arc;
 use std::ffi::CStr;
+use std::sync::Arc;
+use std::{result, slice};
 
 use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
 use grpc_sys::{self, GprClockType, GprTimespec, GrpcCallStatus, GrpcRequestCallContext};
 
-use async::{BatchFuture, CallTag, Executor, SpinLock};
+use super::{RpcStatus, ShareCall, ShareCallHolder, WriteFlags};
+use async::{BatchFuture, CallTag, Executor, Kicker, SpinLock};
 use call::{BatchContext, Call, MethodType, RpcStatusCode, SinkBase, StreamingBase};
 use codec::{DeserializeFn, SerializeFn};
 use cq::CompletionQueue;
 use error::Error;
 use metadata::Metadata;
-use server::{CallBack, Inner};
-use super::{RpcStatus, ShareCall, ShareCallHolder, WriteFlags};
+use server::{BoxHandler, RequestCallContext};
 
 pub struct Deadline {
     spec: GprTimespec,
@@ -52,16 +52,16 @@ impl Deadline {
 /// Context for accepting a request.
 pub struct RequestContext {
     ctx: *mut GrpcRequestCallContext,
-    inner: Option<Arc<Inner>>,
+    request_call: Option<RequestCallContext>,
 }
 
 impl RequestContext {
-    pub fn new(inner: Arc<Inner>) -> RequestContext {
+    pub fn new(rc: RequestCallContext) -> RequestContext {
         let ctx = unsafe { grpc_sys::grpcwrap_request_call_context_create() };
 
         RequestContext {
             ctx,
-            inner: Some(inner),
+            request_call: Some(rc),
         }
     }
 
@@ -71,13 +71,14 @@ impl RequestContext {
     pub fn handle_stream_req(
         self,
         cq: &CompletionQueue,
-        inner: &Inner,
+        rc: &mut RequestCallContext,
     ) -> result::Result<(), Self> {
-        match inner.get_handler(self.method()) {
+        let handler = unsafe { rc.get_handler(self.method()) };
+        match handler {
             Some(handler) => match handler.method_type() {
                 MethodType::Unary | MethodType::ServerStreaming => Err(self),
                 _ => {
-                    execute(self, cq, &[], handler.cb());
+                    execute(self, cq, &[], handler);
                     Ok(())
                 }
             },
@@ -93,9 +94,9 @@ impl RequestContext {
     /// This method should be called after `handle_stream_req`. When handling
     /// client side unary request, handler will only be called after the unary
     /// request is received.
-    pub fn handle_unary_req(self, inner: Arc<Inner>, _: &CompletionQueue) {
+    pub fn handle_unary_req(self, rc: RequestCallContext, _: &CompletionQueue) {
         // fetch message before calling callback.
-        let tag = Box::new(CallTag::unary_request(self, inner));
+        let tag = Box::new(CallTag::unary_request(self, rc));
         let batch_ctx = tag.batch_ctx().unwrap().as_ptr();
         let request_ctx = tag.request_ctx().unwrap().as_ptr();
         let tag_ptr = Box::into_raw(tag);
@@ -110,16 +111,18 @@ impl RequestContext {
         }
     }
 
-    pub fn take_inner(&mut self) -> Option<Arc<Inner>> {
-        self.inner.take()
+    pub fn take_request_call_context(&mut self) -> Option<RequestCallContext> {
+        self.request_call.take()
     }
 
     pub fn as_ptr(&self) -> *mut GrpcRequestCallContext {
         self.ctx
     }
 
-    fn call(&mut self, cq: CompletionQueue) -> Call {
+    fn call(&self, cq: CompletionQueue) -> Call {
         unsafe {
+            // It is okay to use a mutable pointer on a immutable reference, `self`,
+            // because grpcwrap_request_call_context_ref_call is thread-safe.
             let call = grpc_sys::grpcwrap_request_call_context_ref_call(self.ctx);
             assert!(!call.is_null());
             Call::from_raw(call, cq)
@@ -178,15 +181,15 @@ impl Drop for RequestContext {
 /// A context for handling client side unary request.
 pub struct UnaryRequestContext {
     request: RequestContext,
-    inner: Option<Arc<Inner>>,
+    request_call: Option<RequestCallContext>,
     batch: BatchContext,
 }
 
 impl UnaryRequestContext {
-    pub fn new(ctx: RequestContext, inner: Arc<Inner>) -> UnaryRequestContext {
+    pub fn new(ctx: RequestContext, rc: RequestCallContext) -> UnaryRequestContext {
         UnaryRequestContext {
             request: ctx,
-            inner: Some(inner),
+            request_call: Some(rc),
             batch: BatchContext::new(),
         }
     }
@@ -199,21 +202,26 @@ impl UnaryRequestContext {
         &self.request
     }
 
-    pub fn take_inner(&mut self) -> Option<Arc<Inner>> {
-        self.inner.take()
+    pub fn take_request_call_context(&mut self) -> Option<RequestCallContext> {
+        self.request_call.take()
     }
 
-    pub fn handle(mut self, inner: &Arc<Inner>, cq: &CompletionQueue, data: Option<&[u8]>) {
-        let handler = inner.get_handler(self.request.method()).unwrap();
+    pub fn handle(self, rc: &mut RequestCallContext, cq: &CompletionQueue, data: Option<&[u8]>) {
+        let handler = unsafe { rc.get_handler(self.request.method()).unwrap() };
         if let Some(data) = data {
-            return execute(self.request, cq, data, handler.cb());
+            return execute(self.request, cq, data, handler);
         }
 
         let status = RpcStatus::new(RpcStatusCode::Internal, Some("No payload".to_owned()));
-        self.request.call(cq.clone()).abort(status)
+        self.request.call(cq.clone()).abort(&status)
     }
 }
 
+/// A stream for client a streaming call and a duplex streaming call.
+///
+/// The corresponding RPC will be canceled if the stream did not
+/// finish before dropping.
+#[must_use = "if unused the RequestStream may immediately cancel the RPC"]
 pub struct RequestStream<T> {
     call: Arc<SpinLock<ShareCall>>,
     base: StreamingBase,
@@ -251,12 +259,20 @@ impl<T> Stream for RequestStream<T> {
     }
 }
 
+impl<T> Drop for RequestStream<T> {
+    /// The corresponding RPC will be canceled if the stream did not
+    /// finish before dropping.
+    fn drop(&mut self) {
+        self.base.on_drop(&mut self.call);
+    }
+}
+
 /// A helper macro used to implement server side unary sink.
 /// Not using generic here because we don't need to expose
 /// `CallHolder` or `Call` to caller.
 // TODO: Use type alias to be friendly for documentation.
 macro_rules! impl_unary_sink {
-    ($t:ident, $rt:ident, $holder:ty) => (
+    ($(#[$attr:meta])* $t:ident, $rt:ident, $holder:ty) => {
         pub struct $rt {
             call: $holder,
             cq_f: Option<BatchFuture>,
@@ -281,8 +297,9 @@ macro_rules! impl_unary_sink {
             }
         }
 
+        $(#[$attr])*
         pub struct $t<T> {
-            call: $holder,
+            call: Option<$holder>,
             write_flags: u32,
             ser: SerializeFn<T>,
         }
@@ -290,7 +307,7 @@ macro_rules! impl_unary_sink {
         impl<T> $t<T> {
             fn new(call: $holder, ser: SerializeFn<T>) -> $t<T> {
                 $t {
-                    call: call,
+                    call: Some(call),
                     write_flags: 0,
                     ser: ser,
                 }
@@ -312,8 +329,9 @@ macro_rules! impl_unary_sink {
                 });
 
                 let write_flags = self.write_flags;
-                let res = self.call.call(|c| {
-                    c.call.start_send_status_from_server(&status, true, data, write_flags)
+                let res = self.call.as_mut().unwrap().call(|c| {
+                    c.call
+                        .start_send_status_from_server(&status, true, &data, write_flags)
                 });
 
                 let (cq_f, err) = match res {
@@ -322,17 +340,45 @@ macro_rules! impl_unary_sink {
                 };
 
                 $rt {
-                    call: self.call,
+                    call: self.call.take().unwrap(),
                     cq_f: cq_f,
                     err: err,
                 }
             }
         }
-    );
+
+        impl<T> Drop for $t<T> {
+            /// The corresponding RPC will be canceled if the sink did not
+            /// send a response before dropping.
+            fn drop(&mut self) {
+                self.call
+                    .as_mut()
+                    .map(|call| call.call(|c| c.call.cancel()));
+            }
+        }
+    };
 }
 
-impl_unary_sink!(UnarySink, UnarySinkResult, ShareCall);
 impl_unary_sink!(
+    /// A sink for unary call.
+    ///
+    /// To close the sink properly, you should call [`success`] or [`fail`] before dropping.
+    ///
+    /// [`success`]: #method.success
+    /// [`fail`]: #method.fail
+    #[must_use = "if unused the sink may immediately cancel the RPC"]
+    UnarySink,
+    UnarySinkResult,
+    ShareCall
+);
+impl_unary_sink!(
+    /// A sink for client streaming call.
+    ///
+    /// To close the sink properly, you should call [`success`] or [`fail`] before dropping.
+    ///
+    /// [`success`]: #method.success
+    /// [`fail`]: #method.fail
+    #[must_use = "if unused the sink may immediately cancel the RPC"]
     ClientStreamingSink,
     ClientStreamingSinkResult,
     Arc<SpinLock<ShareCall>>
@@ -340,24 +386,27 @@ impl_unary_sink!(
 
 // A macro helper to implement server side streaming sink.
 macro_rules! impl_stream_sink {
-    ($t:ident, $ft:ident, $holder:ty) => (
+    ($(#[$attr:meta])* $t:ident, $ft:ident, $holder:ty) => {
+        $(#[$attr])*
         pub struct $t<T> {
-            call: $holder,
+            call: Option<$holder>,
             base: SinkBase,
             flush_f: Option<BatchFuture>,
             status: RpcStatus,
             flushed: bool,
+            closed: bool,
             ser: SerializeFn<T>,
         }
 
         impl<T> $t<T> {
             fn new(call: $holder, ser: SerializeFn<T>) -> $t<T> {
                 $t {
-                    call: call,
+                    call: Some(call),
                     base: SinkBase::new(true),
                     flush_f: None,
                     status: RpcStatus::ok(),
                     flushed: false,
+                    closed: false,
                     ser: ser,
                 }
             }
@@ -370,8 +419,9 @@ macro_rules! impl_stream_sink {
             pub fn fail(mut self, status: RpcStatus) -> $ft {
                 assert!(self.flush_f.is_none());
                 let send_metadata = self.base.send_metadata;
-                let res = self.call.call(|c| {
-                    c.call.start_send_status_from_server(&status, send_metadata, None, 0)
+                let res = self.call.as_mut().unwrap().call(|c| {
+                    c.call
+                        .start_send_status_from_server(&status, send_metadata, &None, 0)
                 });
 
                 let (fail_f, err) = match res {
@@ -380,9 +430,24 @@ macro_rules! impl_stream_sink {
                 };
 
                 $ft {
-                    call: self.call,
+                    call: self.call.take().unwrap(),
                     fail_f: fail_f,
                     err: err,
+                }
+            }
+        }
+
+        impl<T> Drop for $t<T> {
+            /// The corresponding RPC will be canceled if the sink did not call
+            /// [`close`] or [`fail`] before dropping.
+            ///
+            /// [`close`]: #method.close
+            /// [`fail`]: #method.fail
+            fn drop(&mut self) {
+                // We did not close it explicitly and it was not dropped in the `fail`.
+                if !self.closed && self.call.is_some() {
+                    let mut call = self.call.take().unwrap();
+                    call.call(|c| c.call.cancel());
                 }
             }
         }
@@ -392,16 +457,18 @@ macro_rules! impl_stream_sink {
             type SinkError = Error;
 
             fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Error> {
-                if let Async::Ready(_) = self.call.call(|c| c.poll_finish())? {
+                if let Async::Ready(_) = self.call.as_mut().unwrap().call(|c| c.poll_finish())? {
                     return Err(Error::RemoteStopped);
                 }
                 self.base
-                    .start_send(&mut self.call, &item.0, item.1, self.ser)
-                    .map(|s| if s {
+                    .start_send(self.call.as_mut().unwrap(), &item.0, item.1, self.ser)
+                    .map(|s| {
+                        if s {
                             AsyncSink::Ready
                         } else {
                             AsyncSink::NotReady(item)
-                        })
+                        }
+                    })
             }
 
             fn poll_complete(&mut self) -> Poll<(), Error> {
@@ -414,8 +481,9 @@ macro_rules! impl_stream_sink {
 
                     let send_metadata = self.base.send_metadata;
                     let status = &self.status;
-                    let flush_f = self.call.call(|c| {
-                        c.call.start_send_status_from_server(status, send_metadata, None, 0)
+                    let flush_f = self.call.as_mut().unwrap().call(|c| {
+                        c.call
+                            .start_send_status_from_server(status, send_metadata, &None, 0)
                     })?;
                     self.flush_f = Some(flush_f);
                 }
@@ -425,11 +493,13 @@ macro_rules! impl_stream_sink {
                     self.flushed = true;
                 }
 
-                try_ready!(self.call.call(|c| c.poll_finish()));
+                try_ready!(self.call.as_mut().unwrap().call(|c| c.poll_finish()));
+                self.closed = true;
                 Ok(Async::Ready(()))
             }
         }
 
+        #[must_use = "if unused the sink failure may immediately cancel the RPC"]
         pub struct $ft {
             call: $holder,
             fail_f: Option<BatchFuture>,
@@ -461,11 +531,33 @@ macro_rules! impl_stream_sink {
                 Ok(readiness)
             }
         }
-    )
+    };
 }
 
-impl_stream_sink!(ServerStreamingSink, ServerStreamingSinkFailure, ShareCall);
-impl_stream_sink!(DuplexSink, DuplexSinkFailure, Arc<SpinLock<ShareCall>>);
+impl_stream_sink!(
+    /// A sink for server streaming call.
+    ///
+    /// To close the sink properly, you should call [`close`] or [`fail`] before dropping.
+    ///
+    /// [`close`]: #method.close
+    /// [`fail`]: #method.fail
+    #[must_use = "if unused the sink may immediately cancel the RPC"]
+    ServerStreamingSink,
+    ServerStreamingSinkFailure,
+    ShareCall
+);
+impl_stream_sink!(
+    /// A sink for duplex streaming call.
+    ///
+    /// To close the sink properly, you should call [`close`] or [`fail`] before dropping.
+    ///
+    /// [`close`]: #method.close
+    /// [`fail`]: #method.fail
+    #[must_use = "if unused the sink may immediately cancel the RPC"]
+    DuplexSink,
+    DuplexSinkFailure,
+    Arc<SpinLock<ShareCall>>
+);
 
 /// A context for rpc handling.
 pub struct RpcContext<'a> {
@@ -483,7 +575,12 @@ impl<'a> RpcContext<'a> {
         }
     }
 
-    pub(crate) fn call(&mut self) -> Call {
+    fn kicker(&self) -> Kicker {
+        let call = self.call();
+        Kicker::from_call(call)
+    }
+
+    pub(crate) fn call(&self) -> Call {
         self.ctx.call(self.executor.cq().clone())
     }
 
@@ -516,7 +613,7 @@ impl<'a> RpcContext<'a> {
     where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
-        self.executor.spawn(f)
+        self.executor.spawn(f, self.kicker())
     }
 }
 
@@ -529,18 +626,18 @@ macro_rules! accept_call {
             Err(e) => panic!("unexpected error when trying to accept request: {:?}", e),
             Ok(f) => f,
         }
-    }
+    };
 }
 
 // Helper function to call a unary handler.
 pub fn execute_unary<P, Q, F>(
-    mut ctx: RpcContext,
+    ctx: RpcContext,
     ser: SerializeFn<Q>,
     de: DeserializeFn<P>,
     payload: &[u8],
-    f: &F,
+    f: &mut F,
 ) where
-    F: Fn(RpcContext, P, UnarySink<Q>),
+    F: FnMut(RpcContext, P, UnarySink<Q>),
 {
     let mut call = ctx.call();
     let close_f = accept_call!(call);
@@ -551,7 +648,7 @@ pub fn execute_unary<P, Q, F>(
                 RpcStatusCode::Internal,
                 Some(format!("Failed to deserialize response message: {:?}", e)),
             );
-            call.abort(status);
+            call.abort(&status);
             return;
         }
     };
@@ -561,12 +658,12 @@ pub fn execute_unary<P, Q, F>(
 
 // Helper function to call client streaming handler.
 pub fn execute_client_streaming<P, Q, F>(
-    mut ctx: RpcContext,
+    ctx: RpcContext,
     ser: SerializeFn<Q>,
     de: DeserializeFn<P>,
-    f: &F,
+    f: &mut F,
 ) where
-    F: Fn(RpcContext, RequestStream<P>, ClientStreamingSink<Q>),
+    F: FnMut(RpcContext, RequestStream<P>, ClientStreamingSink<Q>),
 {
     let mut call = ctx.call();
     let close_f = accept_call!(call);
@@ -579,13 +676,13 @@ pub fn execute_client_streaming<P, Q, F>(
 
 // Helper function to call server streaming handler.
 pub fn execute_server_streaming<P, Q, F>(
-    mut ctx: RpcContext,
+    ctx: RpcContext,
     ser: SerializeFn<Q>,
     de: DeserializeFn<P>,
     payload: &[u8],
-    f: &F,
+    f: &mut F,
 ) where
-    F: Fn(RpcContext, P, ServerStreamingSink<Q>),
+    F: FnMut(RpcContext, P, ServerStreamingSink<Q>),
 {
     let mut call = ctx.call();
     let close_f = accept_call!(call);
@@ -597,7 +694,7 @@ pub fn execute_server_streaming<P, Q, F>(
                 RpcStatusCode::Internal,
                 Some(format!("Failed to deserialize response message: {:?}", e)),
             );
-            call.abort(status);
+            call.abort(&status);
             return;
         }
     };
@@ -608,12 +705,12 @@ pub fn execute_server_streaming<P, Q, F>(
 
 // Helper function to call duplex streaming handler.
 pub fn execute_duplex_streaming<P, Q, F>(
-    mut ctx: RpcContext,
+    ctx: RpcContext,
     ser: SerializeFn<Q>,
     de: DeserializeFn<P>,
-    f: &F,
+    f: &mut F,
 ) where
-    F: Fn(RpcContext, RequestStream<P>, DuplexSink<Q>),
+    F: FnMut(RpcContext, RequestStream<P>, DuplexSink<Q>),
 {
     let mut call = ctx.call();
     let close_f = accept_call!(call);
@@ -625,16 +722,18 @@ pub fn execute_duplex_streaming<P, Q, F>(
 }
 
 // A helper function used to handle all undefined rpc calls.
-pub fn execute_unimplemented(mut ctx: RequestContext, cq: CompletionQueue) {
+pub fn execute_unimplemented(ctx: RequestContext, cq: CompletionQueue) {
+    // Suppress needless-pass-by-value.
+    let ctx = ctx;
     let mut call = ctx.call(cq);
     accept_call!(call);
-    call.abort(RpcStatus::new(RpcStatusCode::Unimplemented, None))
+    call.abort(&RpcStatus::new(RpcStatusCode::Unimplemented, None))
 }
 
 // Helper function to call handler.
 //
 // Invoked after a request is ready to be handled.
-fn execute(ctx: RequestContext, cq: &CompletionQueue, payload: &[u8], f: &CallBack) {
+fn execute(ctx: RequestContext, cq: &CompletionQueue, payload: &[u8], f: &mut BoxHandler) {
     let rpc_ctx = RpcContext::new(ctx, cq);
-    f(rpc_ctx, payload)
+    f.handle(rpc_ctx, payload)
 }

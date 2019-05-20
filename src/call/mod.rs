@@ -44,7 +44,6 @@ pub enum MethodType {
     Duplex,
 }
 
-
 /// A description of a remote method.
 // TODO: add serializer and deserializer.
 pub struct Method<Req, Resp> {
@@ -236,8 +235,8 @@ where
 /// set until it is invoked. After invoke, the Call can have messages
 /// written to it and read from it.
 pub struct Call {
-    call: *mut GrpcCall,
-    cq: CompletionQueue,
+    pub call: *mut GrpcCall,
+    pub cq: CompletionQueue,
 }
 
 unsafe impl Send for Call {}
@@ -305,7 +304,7 @@ impl Call {
         &mut self,
         status: &RpcStatus,
         send_empty_metadata: bool,
-        payload: Option<Vec<u8>>,
+        payload: &Option<Vec<u8>>,
         write_flags: u32,
     ) -> Result<BatchFuture> {
         let _cq_ref = self.cq.borrow()?;
@@ -337,7 +336,7 @@ impl Call {
     }
 
     /// Abort an rpc call before handler is called.
-    pub fn abort(self, status: RpcStatus) {
+    pub fn abort(self, status: &RpcStatus) {
         match self.cq.borrow() {
             // Queue is shutdown, ignore.
             Err(Error::QueueShutdown) => return,
@@ -533,6 +532,14 @@ impl StreamingBase {
             Ok(Async::Ready(bytes))
         }
     }
+
+    // Cancel the call if we still have some messages or did not
+    // receive status code.
+    fn on_drop<C: ShareCallHolder>(&self, call: &mut C) {
+        if !self.read_done || self.close_f.is_some() {
+            call.call(|c| c.call.cancel());
+        }
+    }
 }
 
 /// Flags for write operations.
@@ -566,12 +573,12 @@ impl WriteFlags {
     }
 
     /// Get whether buffer hint is enabled.
-    pub fn get_buffer_hint(&self) -> bool {
+    pub fn get_buffer_hint(self) -> bool {
         (self.flags & grpc_sys::GRPC_WRITE_BUFFER_HINT) != 0
     }
 
     /// Get whether compression is disabled.
-    pub fn get_force_no_compress(&self) -> bool {
+    pub fn get_force_no_compress(self) -> bool {
         (self.flags & grpc_sys::GRPC_WRITE_NO_COMPRESS) != 0
     }
 }

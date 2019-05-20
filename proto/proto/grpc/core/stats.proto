@@ -1,4 +1,4 @@
-// Copyright 2018 PingCAP, Inc.
+// Copyright 2017 gRPC authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -8,11 +8,31 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod cancel;
-mod health_check;
-mod kick;
-mod metadata;
-mod misc;
+syntax = "proto3";
+
+package grpc.core;
+
+message Bucket {
+  double start = 1;
+  uint64 count = 2;
+}
+
+message Histogram {
+  repeated Bucket buckets = 1;
+}
+
+message Metric {
+  string name = 1;
+  oneof value {
+    uint64 count = 10;
+    Histogram histogram = 11;
+  }
+}
+
+message Stats {
+  repeated Metric metrics = 1;
+}
